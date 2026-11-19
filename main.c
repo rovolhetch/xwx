@@ -9,8 +9,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <errno.h>
-#include <poll.h>
-#include <time.h>
 
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
@@ -26,8 +24,6 @@
 
 #define XCURSOR_THEME "Simp1e-Adw-Dark"
 #define XCURSOR_SIZE  24
-
-#define DEFAULT_REFRESH_MHZ 60000
 
 #define COLOR_BORDER_ACTIVE_R   85
 #define COLOR_BORDER_ACTIVE_G   170
@@ -60,7 +56,6 @@ struct dimensions_hint {
 struct wl_output_reg {
   uint32_t name;
   struct wl_output *wl_output;
-  int32_t refresh; /* refresh rate of the current mode in mHz, 0 if unknown */
   struct wl_list link; // wm.wl_outputs
 };
 
@@ -213,20 +208,6 @@ struct seat {
   int32_t  op_start_width, op_start_height;
   uint32_t op_edges;
 
-  /* Interactive resize proposal bookkeeping. op_delta is cumulative since the
-   * operation started, so the target size only changes when the pointer moves.
-   * Proposing on every manage sequence makes the client reconfigure for a size
-   * it was already given: each proposal costs a client round trip and the
-   * buffers the client was rendering get discarded. Only changed targets are
-   * proposed, at most once per display frame. */
-  int32_t  op_proposed_width, op_proposed_height;
-  bool     op_proposed;         /* op_proposed_* hold a sent proposal */
-  bool     op_propose_pending;  /* target changed, coalesced by the throttle */
-  bool     op_propose_nudged;   /* manage_dirty sent for the pending proposal */
-  uint32_t op_proposals;        /* proposals sent for the running operation */
-  uint64_t op_proposed_at_ns;   /* CLOCK_MONOTONIC time of the last proposal */
-  uint64_t op_propose_interval_ns; /* cadence, captured when the op started */
-
   struct wp_cursor_shape_device_v1 *cursor_shape_dev;
   struct wl_pointer *wl_pointer;
   int32_t pointer_x;
@@ -268,19 +249,6 @@ struct wl_output *find_wl_output_by_name(struct wm *wm, uint32_t name) {
   wl_list_for_each (reg, &wm->wl_outputs, link)
     if (reg->name == name) return reg->wl_output;
   return NULL;
-}
-
-/* Refresh rate of the output in mHz, 60Hz when the wl_output mode has not been
-   reported yet. Interactive resize proposals are limited to one per display
-   frame, so this bounds how often a window is asked to reconfigure. */
-static int32_t output_refresh(struct output *output) {
-  if (output) {
-    struct wl_output_reg *reg;
-    wl_list_for_each (reg, &output->wm->wl_outputs, link)
-      if (reg->wl_output == output->wl_output && reg->refresh > 0)
-        return reg->refresh;
-  }
-  return DEFAULT_REFRESH_MHZ;
 }
 
 static void output_handle_removed(void *data, struct river_output_v1 *obj) {
@@ -352,11 +320,7 @@ static void wl_output_handle_geometry(
 static void wl_output_handle_mode(
   void *data, struct wl_output *wl_output,
   uint32_t flags, int32_t width, int32_t height, int32_t refresh
-) {
-  struct wl_output_reg *reg = data;
-  if (!(flags & WL_OUTPUT_MODE_CURRENT)) return;
-  reg->refresh = refresh;
-}
+) {}
 
 static const struct wl_output_listener wl_output_listener = {
   .geometry = wl_output_handle_geometry,
@@ -517,9 +481,6 @@ static void window_maybe_destroy(struct window *window) {
       seat_set_cursor_shape(seat, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
       seat->op = SEAT_OP_NONE;
       seat->op_window = NULL;
-      seat->op_proposed = false;
-      seat->op_propose_pending = false;
-      seat->op_propose_nudged = false;
     }
     if (seat->hovered == window) seat->hovered = NULL;
     if (seat->interacted == window) seat->interacted = NULL;
@@ -718,7 +679,6 @@ static void window_apply_mode(struct window *window, uint32_t mode, struct outpu
 
 static void seat_pointer_move(struct seat *seat, struct window *window);
 static void seat_pointer_resize(struct seat *seat, struct window *window, uint32_t edges);
-static uint64_t seat_op_propose_interval_ns(struct seat *seat);
 
 static void window_apply_decoration(struct window *window) {
   if (window->decoration_hint < 0) return;
@@ -1055,9 +1015,6 @@ static void seat_pointer_move(struct seat *seat, struct window *window) {
   seat->op_start_y = window->dimensions.y;
   seat->op_dx = 0;
   seat->op_dy = 0;
-  seat->op_proposed = false;
-  seat->op_propose_pending = false;
-  seat->op_propose_nudged = false;
 }
 
 static void seat_pointer_resize(struct seat *seat, struct window *window, uint32_t edges) {
@@ -1078,20 +1035,6 @@ static void seat_pointer_resize(struct seat *seat, struct window *window, uint32
   seat->op_start_height = window->dimensions.height;
   seat->op_dx = 0;
   seat->op_dy = 0;
-
-  /* Baseline for the de-duplication: nothing is proposed until the pointer has
-     actually moved the window to another size. */
-  seat->op_proposed = true;
-  seat->op_proposed_width = window->dimensions.width;
-  seat->op_proposed_height = window->dimensions.height;
-  seat->op_proposed_at_ns = 0; /* the first changed proposal may go out at once */
-  seat->op_proposals = 0;
-  seat->op_propose_pending = false;
-  seat->op_propose_nudged = false;
-
-  /* Capture the cadence once: the output under the pointer can change during
-     the operation and the deadline must not move backwards mid-wait. */
-  seat->op_propose_interval_ns = seat_op_propose_interval_ns(seat);
 }
 
 static inline pid_t spawn(const char *path, ...) {
@@ -1177,25 +1120,6 @@ static void seat_consume_action(struct seat *seat) {
   seat->pending_action = ACTION_NONE;
 }
 
-static uint64_t now_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
-}
-
-/* One resize proposal per display frame at most. The compositor has to wait for
-   the window to react to a proposed size before it can present it, so asking
-   for several new sizes within one frame only makes the window reconfigure
-   (and discard its in-flight buffers) for sizes that are never presented. */
-static uint64_t seat_op_propose_interval_ns(struct seat *seat) {
-  uint64_t refresh = (uint64_t) output_refresh(output_get_active(seat->wm));
-  return 1000000000000ULL / refresh; /* 1s / refresh in mHz */
-}
-
-/* Absolute target size of the running interactive resize. op_delta is
-   cumulative since the operation started, so this does not depend on the
-   dimensions the window actually has (it may snap to e.g. terminal cell
-   sizes), which is what makes the de-duplication below stable. */
 static void seat_op_target_dimensions(
   struct seat *seat, int32_t *width, int32_t *height
 ) {
@@ -1209,11 +1133,6 @@ static void seat_op_target_dimensions(
   *height = h > 1 ? h : 1;
 }
 
-/* Keep the edge being resized anchored. The requested target size is used
-   rather than the window's current size, because the window lags behind and may
-   snap to a size of its own: the grabbed (left/top) edge then follows the
-   pointer exactly, while with a snapping window the opposite edge is off by the
-   snap amount until the client catches up. */
 static void seat_op_apply_position(struct seat *seat) {
   if (seat->op != SEAT_OP_RESIZE || !seat->op_window) return;
 
@@ -1230,46 +1149,13 @@ static void seat_op_apply_position(struct seat *seat) {
   window_set_position(seat->op_window, x, y);
 }
 
-static void seat_op_propose_dimensions(struct seat *seat, bool flush) {
+static void seat_op_propose_dimensions(struct seat *seat) {
   if (seat->op != SEAT_OP_RESIZE || !seat->op_window) return;
 
   int32_t width, height;
   seat_op_target_dimensions(seat, &width, &height);
 
-  /* De-duplication: without it every manage sequence (op_delta of the same
-     pointer position, focus changes, the throttle's own manage_dirty, ...)
-     sends the same size again, and river forwards each proposal as a configure
-     whenever it differs from the last one sent. Staying silent while the target
-     does not change is what lets the configure/ack/commit cycle settle. */
-  if (seat->op_proposed &&
-      width  == seat->op_proposed_width &&
-      height == seat->op_proposed_height)
-  {
-    seat->op_propose_pending = false;
-    seat->op_propose_nudged = false;
-    return;
-  }
-
-  uint64_t now = now_ns();
-  if (!flush && now - seat->op_proposed_at_ns < seat->op_propose_interval_ns) {
-    /* Coalesce to the next frame. main() wakes up when the deadline passes and
-       asks the server for a manage sequence, in case the pointer already
-       stopped moving (or op_delta stopped arriving). */
-    seat->op_propose_pending = true;
-    seat->op_propose_nudged = false;
-    return;
-  }
-
   river_window_v1_propose_dimensions(seat->op_window->obj, width, height);
-  LOG_DEBG("resize propose %dx%d (#%u)\n", width, height, seat->op_proposals + 1);
-
-  seat->op_proposed = true;
-  seat->op_proposed_width = width;
-  seat->op_proposed_height = height;
-  seat->op_proposed_at_ns = now;
-  seat->op_proposals++;
-  seat->op_propose_pending = false;
-  seat->op_propose_nudged = false;
 }
 
 static void seat_consume_operation(struct seat *seat) {
@@ -1291,58 +1177,20 @@ static void seat_consume_operation(struct seat *seat) {
   /* TODO: unmaximized while resizing */
   case SEAT_OP_RESIZE: {
     if (seat->op_release) {
-      /* Apply the motion the throttle coalesced away: a quick release would
-         otherwise leave the window at the second to last size. */
-      seat_op_propose_dimensions(seat, true);
+      seat_op_propose_dimensions(seat);
       seat_op_apply_position(seat);
-      LOG_DEBG("resize end after %u proposals\n", seat->op_proposals);
-
       river_window_v1_inform_resize_end(seat->op_window->obj);
       river_seat_v1_op_end(seat->obj);
       seat_set_cursor_shape(seat, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
       seat->op = SEAT_OP_NONE;
       seat->op_window = NULL;
-      seat->op_proposed = false;
-      seat->op_propose_pending = false;
-      seat->op_propose_nudged = false;
       break;
     }
-    seat_op_propose_dimensions(seat, false);
+    seat_op_propose_dimensions(seat);
     break;
   }
   }
   seat->op_release = false;
-}
-
-/* Milliseconds until a coalesced resize proposal may be sent, -1 if none. */
-static int seat_propose_timeout_ms(struct wm *wm) {
-  int64_t wait = -1;
-  struct seat *seat;
-  wl_list_for_each (seat, &wm->seats, link) {
-    if (seat->op != SEAT_OP_RESIZE) continue;
-    if (!seat->op_propose_pending || seat->op_propose_nudged) continue;
-
-    uint64_t now = now_ns();
-    uint64_t due = seat->op_proposed_at_ns + seat->op_propose_interval_ns;
-    int64_t ms = due > now ? (int64_t) ((due - now + 999999ULL) / 1000000ULL) : 0;
-    if (wait < 0 || ms < wait) wait = ms;
-  }
-  return (int) wait;
-}
-
-/* Ask the server for another manage sequence so a coalesced proposal can still
-   be sent after the pointer stopped moving. manage_dirty is a no-op safety net
-   otherwise: any manage sequence retries the proposal anyway. */
-static void seat_propose_nudge(struct wm *wm) {
-  bool nudged = false;
-  struct seat *seat;
-  wl_list_for_each (seat, &wm->seats, link) {
-    if (seat->op != SEAT_OP_RESIZE) continue;
-    if (!seat->op_propose_pending || seat->op_propose_nudged) continue;
-    seat->op_propose_nudged = true;
-    nudged = true;
-  }
-  if (nudged) river_window_manager_v1_manage_dirty(wm->rwm);
 }
 
 static void seat_apply_focus(struct seat *seat) {
@@ -1761,39 +1609,6 @@ int main(void) {
   LOG_DEBG("added wm listener\n");
 
   for (;;) {
-    /* A resize proposal that had to be coalesced (see
-       seat_op_propose_dimensions()) needs a manage sequence to be sent in. One
-       arrives by itself as long as the pointer keeps moving, but when it stops
-       within the throttle window nothing would wake us up, so wait for the
-       deadline and then ask the server for a manage sequence. */
-    int timeout = seat_propose_timeout_ms(&wm);
-    if (timeout >= 0) {
-      /* Requests queued by the callbacks of the previous dispatch (manage_finish,
-         render_finish, propose_dimensions, ...) are still sitting in libwayland's
-         write buffer: wl_display_dispatch() only flushes when it is about to
-         block. The compositor waits for those requests, so flush before sleeping
-         in poll(), not after. */
-      if (wl_display_flush(display) < 0) {
-        if (errno == EPIPE) break;
-        if (errno != EAGAIN) LOG_WARN("flush failed: %s\n", strerror(errno));
-      }
-
-      struct pollfd pfd = {
-        .fd = wl_display_get_fd(display),
-        .events = POLLIN,
-      };
-      int ret;
-      do {
-        ret = poll(&pfd, 1, timeout);
-      } while (ret < 0 && errno == EINTR);
-
-      if (ret == 0) {
-        seat_propose_nudge(&wm);
-      } else if (ret < 0) {
-        LOG_WARN("poll failed: %s\n", strerror(errno));
-      }
-    }
-
     if (wl_display_dispatch(display) < 0) {
       if (errno == EPIPE) break;
       LOG_FATA_AND_EXIT("dispatch failed\n");
